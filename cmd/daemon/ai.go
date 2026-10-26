@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,6 +34,7 @@ const (
 
 // System UI with nothing worth classifying.
 var aiSkipApps = map[string]bool{
+	// Windows shell / system
 	"explorer.exe":                true,
 	"searchhost.exe":              true,
 	"searchapp.exe":               true,
@@ -43,7 +45,19 @@ var aiSkipApps = map[string]bool{
 	"systemsettings.exe":          true,
 	"textinputhost.exe":           true,
 	"tracker.exe":                 true,
-	"unknown":                     true,
+	// Linux shell / system / lock screens
+	"gnome-shell":       true,
+	"plasmashell":       true,
+	"kwin_x11":          true,
+	"kwin_wayland":      true,
+	"gnome-screensaver": true,
+	"xscreensaver":      true,
+	"light-locker":      true,
+	"i3lock":            true,
+	"swaylock":          true,
+	"arjan":             true,
+	"tracker":           true,
+	"unknown":           true,
 }
 
 const aiSystemPrompt = `You label computer activity for a student's personal study tracker.
@@ -85,6 +99,10 @@ type Classifier struct {
 	mu       sync.Mutex
 	status   AIStatus
 	attempts map[string]int
+	// backoffUntil pauses classification until a provider quota
+	// resets (e.g. Gemini's daily free-tier limit), instead of
+	// hammering it with doomed requests for hours.
+	backoffUntil time.Time
 }
 
 func NewClassifier(store *Store, rules *RuleEngine, labels *LabelCache, cfg *ConfigStore, lg *log.Logger) *Classifier {
@@ -140,7 +158,31 @@ func (c *Classifier) setStatus(fn func(*AIStatus)) {
 	c.mu.Unlock()
 }
 
+// setBackoffUntil pauses (or, with the zero time, resumes) classification.
+func (c *Classifier) setBackoffUntil(t time.Time) {
+	c.mu.Lock()
+	c.backoffUntil = t
+	c.mu.Unlock()
+}
+
+// ResetBackoff resumes classifying immediately (called when the user
+// changes the AI settings — e.g. switches to another provider).
+func (c *Classifier) ResetBackoff() { c.setBackoffUntil(time.Time{}) }
+
+// backingOff reports how long classification is still paused.
+func (c *Classifier) backingOff() (time.Duration, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if d := time.Until(c.backoffUntil); d > 0 {
+		return d, true
+	}
+	return 0, false
+}
+
 func (c *Classifier) runOnce(ctx context.Context) {
+	if _, off := c.backingOff(); off {
+		return // waiting out a quota reset; status already has the error
+	}
 	pending, err := c.pending()
 	if err != nil {
 		c.setStatus(func(s *AIStatus) { s.LastError = err.Error() })
@@ -169,8 +211,14 @@ func (c *Classifier) runOnce(ctx context.Context) {
 		if err != nil {
 			c.setStatus(func(s *AIStatus) { s.LastError = err.Error() })
 			c.lg.Printf("AI classify: %v", err)
+			if d, ok := quotaReset(err); ok {
+				// Daily quota exhausted: stop trying until it resets.
+				c.setBackoffUntil(time.Now().Add(d))
+				c.lg.Printf("AI paused for %s (quota reset)", fmtDur(int64(d.Seconds())))
+			}
 			break
 		}
+		c.setBackoffUntil(time.Time{}) // working again
 		now := time.Now().Unix()
 		for i, it := range batch {
 			l, ok := got[i]
@@ -331,7 +379,13 @@ func (c *Classifier) Models(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if key := c.cfg.APIKey(); key != "" {
+	if key := c.cfg.APIKey(); anthropicStyle(cfg) {
+		// Anthropic wants its own auth headers, not a Bearer token.
+		if key != "" {
+			req.Header.Set("x-api-key", key)
+		}
+		req.Header.Set("anthropic-version", anthropicVersion)
+	} else if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	resp, err := c.client.Do(req)
@@ -395,33 +449,154 @@ func looksLikeAPIKey(k string) bool {
 
 // ------------------------------------------------------------ HTTP client ---
 
+// anthropicStyle selects Anthropic's Messages API (which is not
+// OpenAI-compatible) instead of the chat-completions protocol.
+// Detected from the preset or the URL, so a custom proxy works too.
+func anthropicStyle(cfg AIConfig) bool {
+	return cfg.Provider == "anthropic" || isAnthropicURL(cfg.BaseURL)
+}
+
+func isAnthropicURL(raw string) bool {
+	return strings.Contains(raw, "api.anthropic.com")
+}
+
+// anthropicVersion is the required version header for /v1/messages.
+const anthropicVersion = "2023-06-01"
+
+// quotaResetRE finds wait hints like "retry in 18h11m44.841786254s"
+// that providers embed in quota error messages.
+var quotaResetRE = regexp.MustCompile(`(?i)retry in (?:(\d+)h)?(?:([\d.]+)m)?(?:([\d.]+)s)?`)
+
+// quotaReset reports how long a provider says to wait before the
+// next attempt (false when the message has no usable hint).
+func quotaReset(err error) (time.Duration, bool) {
+	if err == nil {
+		return 0, false
+	}
+	m := quotaResetRE.FindStringSubmatch(err.Error())
+	if m == nil {
+		return 0, false
+	}
+	var d time.Duration
+	for i, unit := range []time.Duration{time.Hour, time.Minute, time.Second} {
+		if m[i+1] == "" {
+			continue
+		}
+		f, convErr := strconv.ParseFloat(m[i+1], 64)
+		if convErr != nil {
+			return 0, false
+		}
+		d += time.Duration(f * float64(unit))
+	}
+	if d < time.Second {
+		return 0, false
+	}
+	return d, true
+}
+
 func chatComplete(ctx context.Context, client *http.Client, cfg AIConfig, key, system, user string) (string, error) {
-	body := map[string]any{
-		"model": cfg.Model,
-		"messages": []map[string]string{
-			{"role": "system", "content": system},
-			{"role": "user", "content": user},
-		},
-		"response_format": map[string]string{"type": "json_object"},
-	}
-	if isGeminiURL(cfg.BaseURL) {
-		body["reasoning_effort"] = "low" // fast and cheap; this is easy work
-	}
-	content, status, err := postChatRetry(ctx, client, cfg.BaseURL, key, body)
-	if err != nil && status == http.StatusBadRequest {
-		// Some providers reject optional fields; retry plain.
-		delete(body, "response_format")
-		delete(body, "reasoning_effort")
+	var (
+		content string
+		status  int
+		err     error
+	)
+
+	if anthropicStyle(cfg) {
+		content, status, err = retrying(ctx, func() (string, int, time.Duration, error) {
+			return anthropicChat(ctx, client, cfg, key, system, user)
+		})
+	} else {
+		body := map[string]any{
+			"model": cfg.Model,
+			"messages": []map[string]string{
+				{"role": "system", "content": system},
+				{"role": "user", "content": user},
+			},
+			"response_format": map[string]string{"type": "json_object"},
+		}
+		if isGeminiURL(cfg.BaseURL) {
+			body["reasoning_effort"] = "low" // fast and cheap; this is easy work
+		}
 		content, status, err = postChatRetry(ctx, client, cfg.BaseURL, key, body)
+		if err != nil && status == http.StatusBadRequest {
+			// Some providers reject optional fields; retry plain.
+			delete(body, "response_format")
+			delete(body, "reasoning_effort")
+			content, status, err = postChatRetry(ctx, client, cfg.BaseURL, key, body)
+		}
 	}
+
 	if err != nil {
-		switch status {
-		case http.StatusServiceUnavailable, http.StatusTooManyRequests:
-			err = fmt.Errorf("%w — the provider is busy or rate-limiting; Arjan will retry automatically "+
-				"(or pick a lighter model via Settings → Load models)", err)
+		if d, ok := quotaReset(err); ok && (status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable) {
+			err = fmt.Errorf("%w — free-tier daily quota reached; Arjan pauses AI for ~%s, then tries again "+
+				"(switch provider in Settings if you don't want to wait)", err, fmtDur(int64(d.Seconds())))
+		} else {
+			switch status {
+			case http.StatusServiceUnavailable, http.StatusTooManyRequests:
+				err = fmt.Errorf("%w — the provider is busy or rate-limiting; Arjan will retry automatically "+
+					"(or pick a lighter model via Settings → Load models)", err)
+			}
 		}
 	}
 	return content, err
+}
+
+// anthropicChat performs one POST /v1/messages call and returns the
+// text of the reply.
+func anthropicChat(ctx context.Context, client *http.Client, cfg AIConfig, key, system, user string) (string, int, time.Duration, error) {
+	body := map[string]any{
+		"model":      cfg.Model,
+		"max_tokens": 4096,
+		"system":     system,
+		"messages":   []map[string]string{{"role": "user", "content": user}},
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		strings.TrimRight(cfg.BaseURL, "/")+"/messages", bytes.NewReader(data))
+	if err != nil {
+		return "", 0, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", key)
+	req.Header.Set("anthropic-version", anthropicVersion)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+
+	if resp.StatusCode/100 != 2 {
+		e := fmt.Errorf("%s: %s", resp.Status, apiErrorMessage(raw))
+		if secs, perr := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); perr == nil && secs > 0 {
+			return "", resp.StatusCode, time.Duration(secs) * time.Second, e
+		}
+		return "", resp.StatusCode, 0, e
+	}
+
+	var cr struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &cr); err != nil {
+		return "", resp.StatusCode, 0, fmt.Errorf("unexpected response: %w", err)
+	}
+	var out strings.Builder
+	for _, blk := range cr.Content {
+		if blk.Type == "text" || blk.Type == "" {
+			out.WriteString(blk.Text)
+		}
+	}
+	if out.Len() == 0 {
+		return "", resp.StatusCode, 0, errors.New("empty response from model")
+	}
+	return out.String(), resp.StatusCode, 0, nil
 }
 
 // retryDelays are the waits between attempts on temporary failures
@@ -439,11 +614,16 @@ func isTransient(status int, err error) bool {
 	return false
 }
 
-func postChatRetry(ctx context.Context, client *http.Client, baseURL, key string, body map[string]any) (string, int, error) {
+// retrying runs fn, retrying temporary failures with growing waits
+// (shared by the OpenAI-style and Anthropic paths).
+func retrying(ctx context.Context, fn func() (string, int, time.Duration, error)) (string, int, error) {
 	for attempt := 0; ; attempt++ {
-		content, status, retryAfter, err := postChat(ctx, client, baseURL, key, body)
+		content, status, retryAfter, err := fn()
 		if err == nil || attempt >= len(retryDelays) || !isTransient(status, err) {
 			return content, status, err
+		}
+		if d, ok := quotaReset(err); ok && d > time.Minute {
+			return content, status, err // reset is far away; retrying now only wastes attempts
 		}
 		wait := retryDelays[attempt]
 		if retryAfter > 0 && retryAfter <= time.Minute {
@@ -455,6 +635,12 @@ func postChatRetry(ctx context.Context, client *http.Client, baseURL, key string
 		case <-time.After(wait):
 		}
 	}
+}
+
+func postChatRetry(ctx context.Context, client *http.Client, baseURL, key string, body map[string]any) (string, int, error) {
+	return retrying(ctx, func() (string, int, time.Duration, error) {
+		return postChat(ctx, client, baseURL, key, body)
+	})
 }
 
 func postChat(ctx context.Context, client *http.Client, baseURL, key string, body map[string]any) (string, int, time.Duration, error) {

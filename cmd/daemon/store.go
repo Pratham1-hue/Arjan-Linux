@@ -114,9 +114,9 @@ func (st *Store) Delete(id int64) error {
 
 // sessionRow is a session as read back for analysis.
 type sessionRow struct {
-	Start, End          int64
-	App, Title, URL     string
-	Category            string
+	Start, End      int64
+	App, Title, URL string
+	Category        string
 }
 
 // SessionsBetween returns sessions overlapping [from, to),

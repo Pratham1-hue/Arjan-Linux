@@ -105,7 +105,7 @@ func (s *Server) guard(next http.Handler) http.Handler {
 
 const notBuiltHTML = `<!doctype html><html><body style="background:#09090b;color:#e4e4e7;font-family:system-ui;padding:40px">
 <h2>Arjan is running, but the dashboard isn't built yet.</h2>
-<p>Run <code>build.ps1</code> in the project folder (it builds the dashboard into <code>dist\web</code>).</p>
+<p>Run <code>./build.sh</code> (Linux) or <code>build.ps1</code> (Windows) in the project folder — it builds the dashboard into <code>dist/web</code>.</p>
 </body></html>`
 
 func (s *Server) static() http.Handler {
@@ -290,7 +290,6 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		wasEnabled := s.cfg.Get().AI.Enabled
 		err := s.cfg.Update(func(c *Config) {
 			if a.Enabled != nil {
 				c.AI.Enabled = *a.Enabled
@@ -315,7 +314,10 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
-		if !wasEnabled && s.cfg.Get().AI.Enabled {
+		// Settings changed: resume immediately (the old provider's
+		// quota pause must not block the new one) and try a run.
+		s.ai.ResetBackoff()
+		if s.cfg.Get().AI.Enabled {
 			s.ai.Trigger()
 		}
 	}

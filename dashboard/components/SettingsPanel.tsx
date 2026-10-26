@@ -23,7 +23,15 @@ const PRESETS: Preset[] = [
     baseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
     model: "gemini-3.8-flash",
     keyURL: "https://aistudio.google.com/apikey",
-    note: "Free tier available — get a key in Google AI Studio.",
+    note: "Free tier available — but only ~20 requests/day on flash models.",
+  },
+  {
+    id: "anthropic",
+    name: "Anthropic (Claude)",
+    baseURL: "https://api.anthropic.com/v1",
+    model: "claude-haiku-4-5",
+    keyURL: "https://platform.claude.com/settings/keys",
+    note: "Paid per use — Haiku is the cheapest and fast enough for this task.",
   },
   {
     id: "openai",
@@ -261,7 +269,8 @@ export function SettingsPanel({ onClose, onChanged }: { onClose: () => void; onC
               onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
             />
             <span className="mt-1 block text-xs text-zinc-500">
-              Stored encrypted with Windows DPAPI — only your Windows account can read it.
+              Stored locally with user-only permissions (DPAPI-encrypted on Windows) — never sent
+              anywhere but your AI provider.
               {settings?.ai.hasKey && (
                 <>
                   {" "}
@@ -377,11 +386,11 @@ export function SettingsPanel({ onClose, onChanged }: { onClose: () => void; onC
         <section className="space-y-4">
           <div className="flex items-center justify-between gap-4">
             <div>
-              <h3 className="font-medium">Start with Windows</h3>
+              <h3 className="font-medium">Start at login</h3>
               <p className="mt-1 text-xs text-zinc-500">Launch Arjan in the tray when you sign in.</p>
             </div>
             <Toggle
-              label="Start with Windows"
+              label="Start at login"
               on={settings?.startWithWindows ?? false}
               onChange={(v) => run("auto", async () => {
                 setSettings(await api<Settings>("/api/settings", { startWithWindows: v }));

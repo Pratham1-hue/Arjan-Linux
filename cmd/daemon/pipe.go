@@ -8,20 +8,19 @@ import (
 	"net"
 	"strings"
 	"time"
-
-	"github.com/Microsoft/go-winio"
 )
 
-// The browser launches nmhost.exe (a separate, short-lived process) for the
-// extension. nmhost forwards each message to this long-running daemon over a
-// local named pipe, one JSON object per line.
-const pipeName = `\\.\pipe\StudyTrackerBrowser`
+// The browser launches the small native-messaging bridge (nmhost) for
+// the extension. nmhost forwards each message to this long-running
+// daemon over a local socket, one JSON object per line. The transport
+// differs per OS (named pipe on Windows, Unix socket on Linux) and
+// lives in pipe_windows.go / pipe_linux.go; the protocol is shared.
 
-// inbound is the wire format between nmhost and the daemon. It is also the
-// format the Phase 2 extension sends.
+// inbound is the wire format between nmhost and the daemon. It is also
+// the format the extension sends.
 //
-//	{"type":"tab","url":"https://...","title":"...","incognito":false,"browser":"chrome.exe"}
-//	{"type":"shutdown"}                     (used by `tracker.exe --stop`)
+//	{"type":"tab","url":"https://...","title":"...","incognito":false,"browser":"chrome"}
+//	{"type":"shutdown"}                     (used by `arjan --stop`)
 //
 // "browser" is added by nmhost (it detects which browser launched it).
 type inbound struct {
@@ -33,10 +32,7 @@ type inbound struct {
 }
 
 func serveBrowserPipe(ctx context.Context, t *Tracker, onShutdown func(), lg *log.Logger) error {
-	l, err := winio.ListenPipe(pipeName, &winio.PipeConfig{
-		InputBufferSize:  64 * 1024,
-		OutputBufferSize: 4 * 1024,
-	})
+	l, err := browserListener(lg)
 	if err != nil {
 		return err
 	}
@@ -51,7 +47,7 @@ func serveBrowserPipe(ctx context.Context, t *Tracker, onShutdown func(), lg *lo
 			if ctx.Err() != nil {
 				return nil
 			}
-			lg.Printf("pipe accept: %v", err)
+			lg.Printf("browser socket accept: %v", err)
 			time.Sleep(time.Second) // avoid a hot loop on a persistent error
 			continue
 		}
@@ -81,12 +77,12 @@ func handlePipeConn(c net.Conn, t *Tracker, onShutdown func(), lg *log.Logger) {
 
 // sendStop asks a running daemon to exit cleanly. Returns a process exit code.
 func sendStop() int {
-	timeout := time.Second
-	c, err := winio.DialPipe(pipeName, &timeout)
+	c, err := browserDial()
 	if err != nil {
 		return 1
 	}
 	defer c.Close()
+	_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if _, err := c.Write([]byte("{\"type\":\"shutdown\"}\n")); err != nil {
 		return 1
 	}

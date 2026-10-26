@@ -278,7 +278,7 @@ export default function Page() {
       )}
 
       <footer className="mt-8 text-center text-xs text-zinc-600">
-        Arjan · runs locally from your system tray · data stays in %LOCALAPPDATA%\StudyTracker
+        Arjan · runs locally from your system tray · your data never leaves this computer
       </footer>
 
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} onChanged={refresh} />}

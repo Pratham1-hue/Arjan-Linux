@@ -2,15 +2,16 @@
 // on, categorizes it (rules.json + optional AI), and serves the
 // dashboard at http://127.0.0.1:4000.
 //
-//	tracker.exe              start in the tray (opens the dashboard if already running)
-//	tracker.exe --stop       ask the running app to quit cleanly
-//	tracker.exe -report      show today's report now
-//	tracker.exe -db x.db     use a different SQLite file
-//	tracker.exe -rules r.json  use a different rules file
-//	tracker.exe -v           also log to the console
+//	tracker            start in the tray (opens the dashboard if already running)
+//	tracker --stop     ask the running app to quit cleanly
+//	tracker -report    show today's report now
+//	tracker -db x.db   use a different SQLite file
+//	tracker -rules r.json  use a different rules file
+//	tracker -v         also log to the console
 //
-// Data, logs and settings live in %LOCALAPPDATA%\StudyTracker\;
-// rules.json and the dashboard (web\) sit next to the executable.
+// Data, logs and settings live in %LOCALAPPDATA%\StudyTracker\ on
+// Windows and ~/.local/share/arjan/ on Linux; rules.json and the
+// dashboard (web\) sit next to the executable.
 package main
 
 import (
@@ -32,8 +33,8 @@ func main() {
 	attachParentConsole()
 
 	var (
-		dbFlag    = flag.String("db", "", "SQLite database path (default: %LOCALAPPDATA%\\StudyTracker\\study_logs.db)")
-		rulesFlag = flag.String("rules", "", "rules.json path (default: rules.json next to tracker.exe)")
+		dbFlag    = flag.String("db", "", "SQLite database path (default: the per-user data folder)")
+		rulesFlag = flag.String("rules", "", "rules.json path (default: rules.json next to the executable)")
 		verbose   = flag.Bool("v", false, "also log to the console")
 		stop      = flag.Bool("stop", false, "ask a running Arjan to exit, then quit")
 		report    = flag.Bool("report", false, "show today's daily report now, then quit")
@@ -51,7 +52,9 @@ func main() {
 	}
 
 	dir := dataDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// The folder holds the database, logs and your settings: keep it
+	// private to your user.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		fatalf("create data dir: %v", err)
 	}
 	dbPath := *dbFlag
@@ -90,6 +93,11 @@ func main() {
 		sink = io.MultiWriter(logFile, os.Stderr)
 	}
 	lg := log.New(sink, "tracker ", log.LstdFlags)
+	// The tray and X11 libraries log through the standard logger; keep
+	// their messages in daemon.log instead of losing them (a missing
+	// tray icon shows up there).
+	log.SetOutput(sink)
+	logPlatformNotes(lg)
 
 	store, err := OpenStore(dbPath)
 	if err != nil {
@@ -126,7 +134,7 @@ func main() {
 	server := &Server{
 		analyzer: analyzer, tracker: tracker, cfg: cfg, ai: classifier,
 		webDir: filepath.Join(exeDir, "web"), dataDir: dir, rulesPath: engine.Path(),
-		icon: trayIcon(colorActive), lg: lg,
+		icon: faviconICO(colorActive), lg: lg,
 	}
 	if err := server.Start(); err != nil {
 		fatalf("start dashboard server: %v", err)
@@ -156,12 +164,11 @@ func main() {
 		}
 	}()
 
-	// Named pipe that the nmhost.exe bridge forwards browser tabs to.
+	// Local socket that the nmhost bridge forwards browser tabs to.
 	pipeDone := make(chan struct{})
 	go func() {
 		defer close(pipeDone)
 		if err := serveBrowserPipe(ctx, tracker, func() {
-			lg.Printf("shutdown requested")
 			cancel()
 		}, lg); err != nil {
 			lg.Printf("browser pipe: %v", err)
@@ -262,8 +269,5 @@ func dataDir() string {
 	if v := os.Getenv("STUDYTRACKER_DATA"); v != "" {
 		return v
 	}
-	if v := os.Getenv("LOCALAPPDATA"); v != "" {
-		return filepath.Join(v, "StudyTracker")
-	}
-	return "."
+	return platformDataDir()
 }

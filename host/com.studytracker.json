@@ -1,9 +1,9 @@
 {
-  "name": "com.studytracker",
-  "description": "StudyTracker native messaging host — feeds the active browser tab to the tracker daemon.",
-  "path": "C:\\Users\\Pratham Prajapati\\Machine Learning Projects\\Project Arjan\\dist\\nmhost.exe",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://bbodcldflhbgbfhmkdcjmopmeffccene/"
-  ]
+    "name":  "com.studytracker",
+    "description":  "Arjan native messaging host - feeds the active browser tab to tracker.exe.",
+    "path":  "D:\\Machine Learning Projects\\Project Arjan\\dist\\nmhost.exe",
+    "type":  "stdio",
+    "allowed_origins":  [
+                            "chrome-extension://bbodcldflhbgbfhmkdcjmopmeffccene/"
+                        ]
 }

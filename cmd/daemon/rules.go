@@ -76,13 +76,15 @@ func (e *RuleEngine) Reload() error {
 	return nil
 }
 
-// Categorize returns the category for an activity.
+// Categorize returns the category for an activity. The friendly app
+// name is tested too, so one rule ("VS Code") matches both
+// "code.exe" on Windows and "code" on Linux.
 func (e *RuleEngine) Categorize(app, title, url string) string {
 	e.mu.RLock()
 	cats := e.cats
 	e.mu.RUnlock()
 
-	haystack := strings.ToLower(url + "\n" + title + "\n" + app)
+	haystack := strings.ToLower(url + "\n" + title + "\n" + app + "\n" + appName(app))
 	for _, c := range cats {
 		for _, m := range c.Match {
 			if m != "" && strings.Contains(haystack, strings.ToLower(m)) {

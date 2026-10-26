@@ -1,3 +1,9 @@
+//go:build windows
+
+// Windows platform layer: foreground-window hook, idle detection,
+// single-instance mutex and the GUI helpers. The Linux counterpart
+// lives in platform_linux.go; everything else is shared.
+
 package main
 
 import (
@@ -215,3 +221,16 @@ func acquireSingleInstance() bool {
 	_, err := windows.CreateMutex(nil, false, name)
 	return !errors.Is(err, windows.ERROR_ALREADY_EXISTS)
 }
+
+// platformDataDir is where the database, logs and settings live:
+// %LOCALAPPDATA%\StudyTracker.
+func platformDataDir() string {
+	if v := os.Getenv("LOCALAPPDATA"); v != "" {
+		return filepath.Join(v, "StudyTracker")
+	}
+	return "."
+}
+
+// logPlatformNotes logs anything the user should know about this
+// platform (nothing, on Windows).
+func logPlatformNotes(lg *log.Logger) {}

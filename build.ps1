@@ -45,6 +45,9 @@ go build -ldflags "-s -w" -o dist\nmhost.exe ./cmd/nmhost; Check "nmhost build"
 # bridge; stop it so the next reconnect uses the new one.
 Stop-Process -Name nmhost -Force -ErrorAction SilentlyContinue
 
+Write-Host "==> registering the browser bridge (paths follow this folder)"
+& .\install-host.ps1 | Out-Null
+
 if (-not $NoStart) {
   Write-Host "==> enabling 'Start with Windows'"
   $exe = (Resolve-Path dist\tracker.exe).Path

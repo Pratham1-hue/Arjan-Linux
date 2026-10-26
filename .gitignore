@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------
-# Build output (recreated by build.ps1)
+# Build output (recreated by build.sh / build.ps1)
 # ---------------------------------------------------------------
 /dist/
 *.exe
@@ -9,6 +9,10 @@
 *.out
 coverage.*
 *.coverprofile
+
+# Your Chrome extension id (written by `echo <id> > .extension-id`);
+# it is per machine, since unpacked ids are path-derived.
+.extension-id
 
 # ---------------------------------------------------------------
 # Dashboard (Next.js) — see also dashboard/.gitignore

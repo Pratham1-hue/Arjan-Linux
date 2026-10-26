@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -178,6 +180,153 @@ func TestRetriesTransientErrors(t *testing.T) {
 	}
 }
 
+// The Anthropic Messages API is a different protocol than
+// OpenAI's: /v1/messages, x-api-key + anthropic-version headers,
+// system at top level, max_tokens required, reply in content[].
+func TestAnthropicProtocol(t *testing.T) {
+	saved := retryDelays
+	retryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	defer func() { retryDelays = saved }()
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			if r.Header.Get("x-api-key") != "sk-ant-test" || r.Header.Get("anthropic-version") == "" {
+				http.Error(w, `{"type":"error","error":{"type":"authentication_error","message":"bad key"}}`, http.StatusUnauthorized)
+				return
+			}
+			io.WriteString(w, `{"data":[{"id":"claude-haiku-4-5"},{"id":"claude-sonnet-5-5"}],"has_more":false}`)
+		case "/v1/messages":
+			if r.Header.Get("x-api-key") != "sk-ant-test" || r.Header.Get("anthropic-version") != anthropicVersion {
+				t.Errorf("missing auth headers: %v", r.Header)
+				http.Error(w, `{"type":"error","error":{"type":"authentication_error","message":"bad key"}}`, http.StatusUnauthorized)
+				return
+			}
+			if calls.Add(1) == 1 { // transient overload, must be retried
+				http.Error(w, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`, http.StatusServiceUnavailable)
+				return
+			}
+			raw, _ := io.ReadAll(r.Body)
+			var body struct {
+				Model     string              `json:"model"`
+				MaxTokens int                 `json:"max_tokens"`
+				System    string              `json:"system"`
+				Messages  []map[string]string `json:"messages"`
+			}
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Errorf("bad body: %v", err)
+				return
+			}
+			if body.Model != "claude-haiku-4-5" || body.MaxTokens == 0 || body.System == "" ||
+				len(body.Messages) != 1 || body.Messages[0]["role"] != "user" || body.Messages[0]["content"] == "" {
+				t.Errorf("unexpected body: %+v", body)
+			}
+			text := "```json\n{\"items\":[{\"id\":1,\"kind\":\"productive\",\"category\":\"Lecture\"," +
+				"\"subject\":\"Machine Learning\",\"topic\":\"Gradient Descent\"}]}\n```"
+			io.WriteString(w, `{"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":`+
+				strconv.Quote(text)+`}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	if !anthropicStyle(AIConfig{Provider: "anthropic"}) ||
+		!anthropicStyle(AIConfig{BaseURL: "https://api.anthropic.com/v1"}) ||
+		anthropicStyle(AIConfig{Provider: "gemini", BaseURL: "https://x/v1"}) {
+		t.Fatal("anthropicStyle detection broken")
+	}
+
+	cfg := AIConfig{Provider: "anthropic", BaseURL: srv.URL + "/v1", Model: "claude-haiku-4-5"}
+	content, err := chatComplete(context.Background(), srv.Client(), cfg, "sk-ant-test", "label things", "classify")
+	if err != nil {
+		t.Fatalf("chatComplete: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls = %d, want 2 (retried the 503)", calls.Load())
+	}
+	items, err := parseLabels(content)
+	if err != nil || len(items) != 1 || items[0].Subject != "Machine Learning" || items[0].label().Kind != kindProductive {
+		t.Fatalf("parsed %+v, %v", items, err)
+	}
+
+	// Load models through the same path Settings uses.
+	dir := t.TempDir()
+	cfgStore, _ := LoadConfig(filepath.Join(dir, "config.json"))
+	if err := cfgStore.Update(func(c *Config) { c.AI = cfg }); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STUDYTRACKER_AI_KEY", "sk-ant-test")
+	cl := NewClassifier(nil, nil, nil, cfgStore, log.New(io.Discard, "", 0))
+	models, err := cl.Models(context.Background())
+	if err != nil || len(models) != 2 || models[0] != "claude-haiku-4-5" || models[1] != "claude-sonnet-5-5" {
+		t.Fatalf("Models() = %v, %v", models, err)
+	}
+}
+
+// The Gemini free-tier quota error must be understood: parse the
+// reset time, don't retry for 18 hours, and tell the user plainly.
+func TestQuotaResetHint(t *testing.T) {
+	gemini := errors.New(`429 Too Many Requests: You exceeded your current quota, please check your plan and billing details. ` +
+		`For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. ` +
+		`* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, ` +
+		`limit: 20, model: gemini-3.8-flash Please retry in 18h11m44.841786254s.`)
+
+	d, ok := quotaReset(gemini)
+	if !ok || d < 18*time.Hour+11*time.Minute || d > 18*time.Hour+12*time.Minute {
+		t.Fatalf("quotaReset = %v, %v — want ~18h11m", d, ok)
+	}
+	if d2, ok2 := quotaReset(errors.New("server busy, please retry in 45s")); !ok2 || d2 != 45*time.Second {
+		t.Fatalf("short hint: %v, %v", d2, ok2)
+	}
+	if _, ok := quotaReset(errors.New("connection refused")); ok {
+		t.Fatal("false positive on unrelated error")
+	}
+	if _, ok := quotaReset(nil); ok {
+		t.Fatal("nil error should have no hint")
+	}
+
+	saved := retryDelays
+	retryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	defer func() { retryDelays = saved }()
+
+	// Hours-away quota: exactly one attempt, no futility.
+	var n atomic.Int32
+	_, status, err := retrying(context.Background(), func() (string, int, time.Duration, error) {
+		n.Add(1)
+		return "", http.StatusTooManyRequests, 0, gemini
+	})
+	if n.Load() != 1 || status != http.StatusTooManyRequests || err == nil {
+		t.Fatalf("long quota: n=%d status=%d err=%v", n.Load(), status, err)
+	}
+
+	// A short hint (<= 1 min) is still worth retrying.
+	n.Store(0)
+	content, _, err := retrying(context.Background(), func() (string, int, time.Duration, error) {
+		if n.Add(1) == 1 {
+			return "", http.StatusTooManyRequests, 0, errors.New("retry in 45s")
+		}
+		return "ok", http.StatusOK, 0, nil
+	})
+	if err != nil || content != "ok" || n.Load() != 2 {
+		t.Fatalf("short quota hint: content=%q n=%d err=%v", content, n.Load(), err)
+	}
+
+	// The surfaced message explains the pause instead of promising retries.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		io.WriteString(w, `{"error":{"message":"`+strings.ReplaceAll(gemini.Error(), `"`, "'")+`"}}`)
+	}))
+	defer srv.Close()
+	cfg := AIConfig{Provider: "gemini", BaseURL: srv.URL, Model: "gemini-3.8-flash"}
+	_, err = chatComplete(context.Background(), srv.Client(), cfg, "k", "sys", "user")
+	if err == nil || !strings.Contains(err.Error(), "free-tier daily quota") ||
+		!strings.Contains(err.Error(), "18h") || !strings.Contains(err.Error(), "switch provider") {
+		t.Fatalf("message = %v", err)
+	}
+}
+
 func TestSettingsValidation(t *testing.T) {
 	bad := []string{
 		"503 Service Unavailable: This model is currently experiencing high demand. Please try again later.",
@@ -204,7 +353,9 @@ func TestSettingsValidation(t *testing.T) {
 	}
 }
 
-func TestAPIKeyEncryptedAtRest(t *testing.T) {
+// The API key must never be stored verbatim: DPAPI on Windows, mode
+// 0600 + a format prefix on Linux. Either way it survives a reload.
+func TestAPIKeyAtRest(t *testing.T) {
 	t.Setenv("STUDYTRACKER_AI_KEY", "")
 	path := filepath.Join(t.TempDir(), "config.json")
 	cfg, _ := LoadConfig(path)

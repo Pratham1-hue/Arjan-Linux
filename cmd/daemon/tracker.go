@@ -19,16 +19,26 @@ const (
 	maxURLRunes    = 2048
 )
 
-// Browsers whose active tab is reported by the extension. Extend if needed.
+// Browsers whose active tab is reported by the extension. Extend if
+// needed. Linux uses the executable's own name (from /proc/<pid>/exe),
+// Windows uses the image name.
 var browserExes = map[string]bool{
+	// Windows
 	"chrome.exe": true,
 	"msedge.exe": true,
 	"brave.exe":  true,
+	// Linux
+	"chrome":         true,
+	"google-chrome":  true,
+	"chromium":       true,
+	"brave":          true,
+	"microsoft-edge": true,
+	"vivaldi":        true,
 }
 
 type windowInfo struct {
 	hwnd  uintptr
-	exe   string // lower-case image name, e.g. "chrome.exe"; "" = no foreground window
+	exe   string // lower-case executable name, e.g. "chrome"; "" = no foreground window
 	title string
 }
 
@@ -212,7 +222,7 @@ func (t *Tracker) tick() time.Duration {
 		if !t.idle {
 			t.idle = true
 			t.closeLocked(now - int64(idleFor/time.Second)) // end at the last real input
-			t.distractSince = 0 // idle breaks a distraction streak
+			t.distractSince = 0                             // idle breaks a distraction streak
 			t.nudged = false
 			t.logf("idle for %s: logging paused", idleFor.Round(time.Second))
 		}

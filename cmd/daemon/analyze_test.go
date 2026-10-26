@@ -184,7 +184,7 @@ func TestPauseResumeWithLogger(t *testing.T) {
 }
 
 func TestTrayIconIsValidICO(t *testing.T) {
-	ico := trayIcon(colorActive)
+	ico := faviconICO(colorActive)
 	if len(ico) < 6+16*4 || ico[0] != 0 || ico[2] != 1 || ico[4] != 4 {
 		t.Fatalf("bad ICO header: % x", ico[:6])
 	}
